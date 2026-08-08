@@ -172,7 +172,7 @@ static bool isOverviewSubmapActive() {
     return Keybinds::mgr() && Keybinds::mgr()->currentSubmap() == OVERVIEW_SUBMAP;
 }
 
-static bool hasMatchingScrollKeybind(const IPointer::SAxisEvent& event) {
+static bool hasApplicableScrollKeybind(const IPointer::SAxisEvent& event) {
     if (!Keybinds::mgr() || !g_pInputManager || event.source != WL_POINTER_AXIS_SOURCE_WHEEL || event.delta == 0.0)
         return false;
 
@@ -184,18 +184,20 @@ static bool hasMatchingScrollKeybind(const IPointer::SAxisEvent& event) {
     else
         return false;
 
-    const auto MODS    = g_pInputManager->getModsFromAllKBs();
-    const auto SUBMAP  = Keybinds::mgr()->currentSubmap();
-    const auto MATCHES = std::ranges::any_of(Keybinds::mgr()->registry().binds(), [&](const auto& keybind) {
-        return keybind && keybind->enabled() && std::ranges::contains(keybind->keyNames(), key) &&
+    const auto MODS   = g_pInputManager->getModsFromAllKBs();
+    const auto SUBMAP = Keybinds::mgr()->currentSubmap();
+    return std::ranges::any_of(Keybinds::mgr()->registry().binds(), [&](const auto& keybind) {
+        return keybind && keybind->enabled() && !Keybinds::mgr()->m_shadowed.contains(keybind) && std::ranges::contains(keybind->keyNames(), key) &&
             (keybind->modifierMask() == MODS || keybind->hasFlag(Keybinds::BIND_FLAG_IGNORE_MODS)) &&
             (keybind->metadata().submap == SUBMAP || keybind->hasFlag(Keybinds::BIND_FLAG_SUBMAP_UNIVERSAL));
     });
+}
 
-    if (MATCHES)
-        g_pendingMouseAxisBindTimeMs = event.timeMs;
+static bool scrollKeybindIsThrottled() {
+    if (!Keybinds::mgr())
+        return false;
 
-    return MATCHES;
+    return Keybinds::mgr()->m_scrollTimer.getMillis() < ScrollOverview::Config::getValue<int>("binds:scroll_event_delay");
 }
 
 static bool isTopLayerFocused(PHLMONITOR monitor) {
@@ -1425,11 +1427,17 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_, PHLMONITO
     };
 
     auto onMouseAxis = [this](IPointer::SAxisEvent e, Event::SCallbackInfo& info) {
-        if (closing || scrollOverviewAt(g_pInputManager->getMouseCoordsInternal()).get() != this)
+        if (info.cancelled || closing || scrollOverviewAt(g_pInputManager->getMouseCoordsInternal()).get() != this)
             return;
 
-        if (usesSubmapKeybinds && isOverviewSubmapActive() && hasMatchingScrollKeybind(e))
+        if (usesSubmapKeybinds && isOverviewSubmapActive() && hasApplicableScrollKeybind(e)) {
+            if (scrollKeybindIsThrottled()) {
+                g_pendingMouseAxisBindTimeMs.reset();
+                info.cancelled = true;
+            } else
+                g_pendingMouseAxisBindTimeMs = e.timeMs;
             return;
+        }
 
         info.cancelled = true;
 
@@ -2463,17 +2471,10 @@ void CScrollOverview::selectHoveredWorkspace() {
 }
 
 bool CScrollOverview::windowDispatcherAction(const std::string& action) {
-    const auto& ACTIONSTATE  = Config::Actions::state();
-    const bool FROMMOUSEBIND = ACTIONSTATE && ACTIONSTATE->m_bindInvocationDepth > 0 && ACTIONSTATE->m_lastCode == 0 && ACTIONSTATE->m_lastMouseCode != 0;
+    lastMousePosLocal = getOverviewMousePosLocal(pMonitor.lock());
 
-    PHLWINDOW WINDOW;
     size_t    workspaceIdx = viewportCurrentWorkspace;
-
-    if (FROMMOUSEBIND) {
-        lastMousePosLocal = getOverviewMousePosLocal(pMonitor.lock());
-        WINDOW            = windowAtOverviewCursor(&workspaceIdx);
-    } else
-        WINDOW = getOverviewWindowToShow(closeOnWindow.lock());
+    PHLWINDOW WINDOW       = windowAtOverviewCursor(&workspaceIdx);
 
     if (!WINDOW)
         return false;
