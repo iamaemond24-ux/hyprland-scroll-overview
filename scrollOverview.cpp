@@ -11,6 +11,8 @@
 #include <linux/input-event-codes.h>
 #include <state/MonitorState.hpp>
 #include <state/WorkspaceState.hpp>
+#include <hyprland/src/workspace/RegularWorkspace.hpp>
+#include <hyprland/src/workspace/query/Query.hpp>
 #define private public
 #define protected public
 #include <hyprland/src/render/Renderer.hpp>
@@ -100,8 +102,8 @@ static bool changeOverviewWorkspace(const PHLMONITOR& monitor, const PHLWORKSPAC
     if (!FOCUSED || monitor->m_activeWorkspace != workspace)
         return true;
 
-    IPC::Socket2::sock()->postEvent({.event = "workspace", .data = workspace->m_name});
-    IPC::Socket2::sock()->postEvent({.event = "workspacev2", .data = std::format("{},{}", workspace->m_id, workspace->m_name)});
+    IPC::Socket2::sock()->postEvent({.event = "workspace", .data = workspace->displayName()});
+    IPC::Socket2::sock()->postEvent({.event = "workspacev2", .data = std::format("{},{}", Workspace::selector(*workspace), workspace->displayName())});
     Event::bus()->m_events.workspace.active.emit(workspace);
 
     return true;
@@ -116,7 +118,7 @@ static void restoreActiveWorkspaceVisibility() {
             if (!workspace)
                 continue;
 
-            workspace->m_visible = true;
+            workspace->setVisible(true);
             workspace->m_alpha->setValueAndWarp(1.F);
             workspace->m_renderOffset->setValueAndWarp(Vector2D{});
         }
@@ -791,10 +793,10 @@ static Layout::Tiled::CScrollingAlgorithm* overviewScrollingAlgorithmForTarget(c
 }
 
 static Layout::Tiled::CScrollingAlgorithm* overviewScrollingAlgorithmForWorkspace(const PHLWORKSPACE& workspace) {
-    if (!workspace || !workspace->m_space || !workspace->m_space->algorithm())
+    if (!workspace || !workspace->space() || !workspace->space()->algorithm())
         return nullptr;
 
-    return dc<Layout::Tiled::CScrollingAlgorithm*>(workspace->m_space->algorithm()->m_tiled.get());
+    return dc<Layout::Tiled::CScrollingAlgorithm*>(workspace->space()->algorithm()->m_tiled.get());
 }
 
 static bool isWorkspaceScrolling(const PHLWORKSPACE& workspace) {
@@ -821,10 +823,10 @@ static CBox getOverviewWorkspaceUsableBox(const PHLWORKSPACE& workspace, PHLMONI
         return getOverviewBox(USABLE, monitor, scale, viewOffset, offset, layout);
     }
 
-    if (!workspace->m_space)
+    if (!workspace->space())
         return getOverviewWorkspaceBox(monitor, scale, viewOffset, offset, layout);
 
-    auto USABLE = workspace->m_space->workArea();
+    auto USABLE = workspace->space()->workArea();
     USABLE.translate(-monitor->m_position);
     USABLE.w = std::max(USABLE.w, 1.0);
     USABLE.h = std::max(USABLE.h, 1.0);
@@ -1783,15 +1785,15 @@ float CScrollOverview::workspaceOverviewOffset(size_t workspaceIdx, size_t activ
     if (!workspaceInsertTransition.active || workspaceIdx >= images.size() || !images[workspaceIdx] || !images[workspaceIdx]->pWorkspace)
         return DEFAULTOFFSET;
 
-    const auto WORKSPACEID = images[workspaceIdx]->pWorkspace->m_id;
-    const auto NEWIT       = workspaceInsertTransition.newRelativeOffsets.find(WORKSPACEID);
+    const auto WORKSPACEKEY = Workspace::selector(*images[workspaceIdx]->pWorkspace);
+    const auto NEWIT        = workspaceInsertTransition.newRelativeOffsets.find(WORKSPACEKEY);
     if (NEWIT == workspaceInsertTransition.newRelativeOffsets.end())
         return DEFAULTOFFSET;
 
     const float T         = std::clamp(workspaceInsertProgress->value(), 0.F, 1.F);
     const float NEWOFFSET = NEWIT->second * RENDEREDLOGICALUNIT;
 
-    if (const auto OLDIT = workspaceInsertTransition.oldRelativeOffsets.find(WORKSPACEID); OLDIT != workspaceInsertTransition.oldRelativeOffsets.end()) {
+    if (const auto OLDIT = workspaceInsertTransition.oldRelativeOffsets.find(WORKSPACEKEY); OLDIT != workspaceInsertTransition.oldRelativeOffsets.end()) {
         const float OLDOFFSET = OLDIT->second * RENDEREDLOGICALUNIT;
         return OLDOFFSET + (NEWOFFSET - OLDOFFSET) * T;
     }
@@ -1827,13 +1829,13 @@ float CScrollOverview::workspaceOverviewAlpha(size_t workspaceIdx) const {
     if (!workspaceInsertTransition.active || workspaceIdx >= images.size() || !images[workspaceIdx] || !images[workspaceIdx]->pWorkspace)
         return 1.F;
 
-    if (images[workspaceIdx]->pWorkspace->m_id != workspaceInsertTransition.transitionWorkspaceID)
+    if (Workspace::selector(*images[workspaceIdx]->pWorkspace) != workspaceInsertTransition.transitionWorkspaceKey)
         return 1.F;
 
     if (!workspaceInsertTransition.transitionFadeIn)
         return 1.F;
 
-    if (workspaceInsertTransition.oldRelativeOffsets.contains(workspaceInsertTransition.transitionWorkspaceID))
+    if (workspaceInsertTransition.oldRelativeOffsets.contains(workspaceInsertTransition.transitionWorkspaceKey))
         return 1.F;
 
     return std::clamp(workspaceInsertFadeProgress->value(), 0.F, 1.F);
@@ -1849,7 +1851,7 @@ void CScrollOverview::rebuildWorkspaceImages() {
 
     for (const auto& w : State::workspaceState()->workspaces()) {
         const auto WORKSPACE = w.lock();
-        if (!valid(WORKSPACE) || WORKSPACE->m_monitor != pMonitor || WORKSPACE->m_isSpecialWorkspace)
+        if (!valid(WORKSPACE) || WORKSPACE->m_monitor != pMonitor || WORKSPACE->type() == Workspace::eWorkspaceType::SPECIAL)
             continue;
 
         if (WORKSPACE == REMOVEDWORKSPACE)
@@ -1858,7 +1860,17 @@ void CScrollOverview::rebuildWorkspaceImages() {
         images.emplace_back(makeShared<SWorkspaceImage>(WORKSPACE));
     }
 
-    std::sort(images.begin(), images.end(), [](const auto& a, const auto& b) { return a->pWorkspace->m_id < b->pWorkspace->m_id; });
+    // Named workspaces have no numeric ID. Keep them before numbered workspaces,
+    // order them by their address, and compare numbered IDs numerically (2 < 10).
+    std::sort(images.begin(), images.end(), [](const auto& a, const auto& b) {
+        const auto AID = a->pWorkspace->numberedID();
+        const auto BID = b->pWorkspace->numberedID();
+        if (AID && BID)
+            return *AID < *BID;
+        if (AID.has_value() != BID.has_value())
+            return !AID.has_value();
+        return a->pWorkspace->addressableName() < b->pWorkspace->addressableName();
+    });
 
     if (images.empty()) {
         viewportCurrentWorkspace = 0;
@@ -1890,9 +1902,9 @@ void CScrollOverview::seedRememberedSelections() {
         if (!img->pWorkspace)
             continue;
 
-        const auto WORKSPACEID = img->pWorkspace->m_id;
+        const auto WORKSPACEKEY = Workspace::selector(*img->pWorkspace);
 
-        if (const auto it = rememberedSelection.find(WORKSPACEID); it != rememberedSelection.end()) {
+        if (const auto it = rememberedSelection.find(WORKSPACEKEY); it != rememberedSelection.end()) {
             const auto rememberedWindow = getOverviewWindowToShow(it->second.lock());
             if (rememberedWindow && rememberedWindow->m_workspace == img->pWorkspace && shouldShowOverviewWindow(rememberedWindow))
                 continue;
@@ -1902,7 +1914,7 @@ void CScrollOverview::seedRememberedSelections() {
         if (!lastFocusedWindow || lastFocusedWindow->m_workspace != img->pWorkspace || !shouldShowOverviewWindow(lastFocusedWindow))
             continue;
 
-        rememberedSelection[WORKSPACEID] = lastFocusedWindow;
+        rememberedSelection[WORKSPACEKEY] = lastFocusedWindow;
     }
 }
 
@@ -1912,7 +1924,7 @@ void CScrollOverview::rememberSelection(PHLWINDOW window) {
     if (!window || !window->m_workspace)
         return;
 
-    rememberedSelection[window->m_workspace->m_id] = window;
+    rememberedSelection[Workspace::selector(*window->m_workspace)] = window;
 }
 
 void CScrollOverview::updateWorkspaceOverflow() {
@@ -2395,10 +2407,10 @@ PHLWORKSPACE CScrollOverview::workspaceAtOverviewCursor(size_t* hoveredWorkspace
 }
 
 static void syncWorkspaceGeometry(const PHLWORKSPACE& workspace) {
-    if (!workspace || !workspace->m_space)
+    if (!workspace || !workspace->space())
         return;
 
-    for (const auto& targetRef : workspace->m_space->targets()) {
+    for (const auto& targetRef : workspace->space()->targets()) {
         const auto TARGET = targetRef.lock();
         if (TARGET)
             TARGET->warpPositionSize();
@@ -2442,8 +2454,8 @@ void CScrollOverview::selectHoveredWorkspace() {
     viewportCurrentWorkspace = workspaceIdx;
 
     if (pMonitor && pMonitor->m_activeWorkspace != WORKSPACE) {
-        if (focusSyncedFromWorkspaceID == WORKSPACE_INVALID)
-            focusSyncedFromWorkspaceID = pMonitor->m_activeWorkspace ? pMonitor->m_activeWorkspace->m_id : WORKSPACE_INVALID;
+        if (focusSyncedFromWorkspaceKey.empty())
+            focusSyncedFromWorkspaceKey = pMonitor->m_activeWorkspace ? Workspace::selector(*pMonitor->m_activeWorkspace) : "";
         changeOverviewWorkspace(pMonitor.lock(), WORKSPACE);
     }
 
@@ -2526,12 +2538,11 @@ CBox CScrollOverview::draggedWindowGlobalBox() const {
     if (!WINDOW || !MONITOR)
         return {};
 
-    const auto WORKSPACEIDX = dragWorkspaceIndex(WINDOW);
-    if (WORKSPACEIDX >= images.size())
+    const auto WORKSPACEKEYX = dragWorkspaceIndex(WINDOW);
+    if (WORKSPACEKEYX >= images.size())
         return {};
 
-    const auto WORKSPACEOFFSET =
-        workspaceOverviewOffset(WORKSPACEIDX, activeWorkspaceIndex(), getWorkspaceRenderedPitch(MONITOR, scale->value(), layout));
+    const auto WORKSPACEOFFSET = workspaceOverviewOffset(WORKSPACEKEYX, activeWorkspaceIndex(), getWorkspaceRenderedPitch(MONITOR, scale->value(), layout));
     const auto SOURCEBOX =
         getOverviewDragWindowBox(WINDOW, MONITOR, scale->value(), viewOffset->value(), WORKSPACEOFFSET, layout, false);
     const auto GLOBALSIZE = SOURCEBOX.size() * (1.F / std::max(MONITOR->m_scale, 0.01F));
@@ -3258,7 +3269,7 @@ void CScrollOverview::moveViewportWorkspace(bool up) {
 
     closeOnWindow.reset();
 
-    if (const auto it = rememberedSelection.find(TARGETWORKSPACEIMAGE->pWorkspace->m_id); it != rememberedSelection.end()) {
+    if (const auto it = rememberedSelection.find(Workspace::selector(*TARGETWORKSPACEIMAGE->pWorkspace)); it != rememberedSelection.end()) {
         const auto rememberedWindow = getOverviewWindowToShow(it->second.lock());
         if (rememberedWindow && rememberedWindow->m_workspace == TARGETWORKSPACEIMAGE->pWorkspace && shouldShowOverviewWindow(rememberedWindow))
             closeOnWindow = rememberedWindow;
@@ -3429,7 +3440,7 @@ void CScrollOverview::syncSelectionToViewport() {
         }
     }
 
-    if (const auto it = rememberedSelection.find(WSPACE->pWorkspace->m_id); it != rememberedSelection.end()) {
+    if (const auto it = rememberedSelection.find(Workspace::selector(*WSPACE->pWorkspace)); it != rememberedSelection.end()) {
         const auto rememberedWindow = getOverviewWindowToShow(it->second.lock());
         if (rememberedWindow && rememberedWindow->m_workspace == WSPACE->pWorkspace && shouldShowOverviewWindow(rememberedWindow)) {
             for (const auto& windowRef : WSPACE->windows) {
@@ -3479,8 +3490,8 @@ void CScrollOverview::syncFocusedSelection() {
 
     Desktop::focusState()->fullWindowFocus(window, Desktop::FOCUS_REASON_KEYBIND);
 
-    if (window->m_workspace != PREVIOUSWORKSPACE && focusSyncedFromWorkspaceID == WORKSPACE_INVALID)
-        focusSyncedFromWorkspaceID = PREVIOUSWORKSPACE ? PREVIOUSWORKSPACE->m_id : WORKSPACE_INVALID;
+    if (window->m_workspace != PREVIOUSWORKSPACE && focusSyncedFromWorkspaceKey.empty())
+        focusSyncedFromWorkspaceKey = PREVIOUSWORKSPACE ? Workspace::selector(*PREVIOUSWORKSPACE) : "";
 }
 
 size_t CScrollOverview::dragWorkspaceIndex(PHLWINDOW window) const {
@@ -3993,13 +4004,13 @@ void CScrollOverview::renderWorkspaceBackground(PHLMONITOR monitor, size_t works
         return;
 
     const auto workspace         = workspaceImage->pWorkspace;
-    const bool WASVISIBLE        = workspace->m_visible;
+    const bool WASVISIBLE        = workspace->visible();
     const bool WASFORCERENDERING = workspace->m_forceRendering;
-    workspace->m_visible         = true;
+    workspace->setVisible(true);
     workspace->m_forceRendering  = true;
 
     auto restoreWorkspaceState = Hyprutils::Utils::CScopeGuard([workspace, WASVISIBLE, WASFORCERENDERING] {
-        workspace->m_visible        = WASVISIBLE;
+        workspace->setVisible(WASVISIBLE);
         workspace->m_forceRendering = WASFORCERENDERING;
     });
 
@@ -4028,13 +4039,13 @@ void CScrollOverview::renderWorkspaceLive(PHLMONITOR monitor, size_t workspaceId
         return;
 
     const auto workspace         = workspaceImage->pWorkspace;
-    const bool WASVISIBLE        = workspace->m_visible;
+    const bool WASVISIBLE        = workspace->visible();
     const bool WASFORCERENDERING = workspace->m_forceRendering;
-    workspace->m_visible         = true;
+    workspace->setVisible(true);
     workspace->m_forceRendering  = true;
 
-    auto restoreWorkspaceState = Hyprutils::Utils::CScopeGuard([workspace, WASVISIBLE, WASFORCERENDERING] {
-        workspace->m_visible        = WASVISIBLE;
+    auto       restoreWorkspaceState = Hyprutils::Utils::CScopeGuard([workspace, WASVISIBLE, WASFORCERENDERING] {
+        workspace->setVisible(WASVISIBLE);
         workspace->m_forceRendering = WASFORCERENDERING;
     });
 
@@ -4256,12 +4267,12 @@ void CScrollOverview::redrawAll(bool forcelowres) {
     }
     pinnedFloatingWindows.clear();
 
-    std::unordered_map<WORKSPACEID, SP<SWorkspaceImage>> imagesByWorkspace;
+    std::unordered_map<std::string, SP<SWorkspaceImage>> imagesByWorkspace;
     imagesByWorkspace.reserve(images.size());
 
     for (const auto& img : images) {
         if (img && img->pWorkspace)
-            imagesByWorkspace.emplace(img->pWorkspace->m_id, img);
+            imagesByWorkspace.emplace(Workspace::selector(*img->pWorkspace), img);
     }
 
     std::vector<PHLWINDOW> addedWindows;
@@ -4278,7 +4289,7 @@ void CScrollOverview::redrawAll(bool forcelowres) {
         if (std::ranges::find(addedWindows, overviewWindow) != addedWindows.end())
             return;
 
-        const auto imageIt = imagesByWorkspace.find(overviewWindow->m_workspace->m_id);
+        const auto imageIt = imagesByWorkspace.find(Workspace::selector(*overviewWindow->m_workspace));
         if (imageIt == imagesByWorkspace.end())
             return;
 
@@ -4842,7 +4853,7 @@ void CScrollOverview::close() {
 
     closeOnWindow = getOverviewWindowToShow(closeOnWindow.lock());
 
-    if (closeOnWindow && focusSyncedFromWorkspaceID != WORKSPACE_INVALID) {
+    if (closeOnWindow && !focusSyncedFromWorkspaceKey.empty()) {
         const auto FINALWORKSPACE = closeOnWindow->m_workspace;
         size_t     sourceIdx      = images.size();
         size_t     targetIdx      = images.size();
@@ -4851,7 +4862,7 @@ void CScrollOverview::close() {
             if (!images[workspaceIdx] || !images[workspaceIdx]->pWorkspace)
                 continue;
 
-            if (images[workspaceIdx]->pWorkspace->m_id == focusSyncedFromWorkspaceID)
+            if (Workspace::selector(*images[workspaceIdx]->pWorkspace) == focusSyncedFromWorkspaceKey)
                 sourceIdx = workspaceIdx;
             if (images[workspaceIdx]->pWorkspace == FINALWORKSPACE)
                 targetIdx = workspaceIdx;
@@ -4871,7 +4882,7 @@ void CScrollOverview::close() {
             viewOffset->setValueAndWarp(axisOffsetVector(workspaceOverviewLogicalOffset(sourceIdx, targetIdx, FINALPITCH), layout));
             *viewOffset = Vector2D{};
 
-            focusSyncedFromWorkspaceID = WORKSPACE_INVALID;
+            focusSyncedFromWorkspaceKey.clear();
 
             const auto FINALWINDOW = getOverviewWindowToShow(closeOnWindow.lock());
             finishClose(FINALWORKSPACE, FINALWINDOW);
@@ -4895,12 +4906,12 @@ void CScrollOverview::close() {
         if (SELECTEDWORKSPACE && SELECTEDWORKSPACE != pMonitor->m_activeWorkspace)
             changeOverviewWorkspace(pMonitor.lock(), SELECTEDWORKSPACE);
     } else if (closeOnWindow == Desktop::focusState()->window() && closeOnWindow->m_workspace == pMonitor->m_activeWorkspace) {
-        if (focusSyncedFromWorkspaceID != WORKSPACE_INVALID) {
+        if (!focusSyncedFromWorkspaceKey.empty()) {
             const auto ACTIVEIDX   = activeWorkspaceIndex();
             const auto FINALPITCH = getWorkspaceLogicalPitch(pMonitor.lock(), 1.F, layout);
 
             for (size_t workspaceIdx = 0; workspaceIdx < images.size(); ++workspaceIdx) {
-                if (!images[workspaceIdx] || !images[workspaceIdx]->pWorkspace || images[workspaceIdx]->pWorkspace->m_id != focusSyncedFromWorkspaceID)
+                if (!images[workspaceIdx] || !images[workspaceIdx]->pWorkspace || Workspace::selector(*images[workspaceIdx]->pWorkspace) != focusSyncedFromWorkspaceKey)
                     continue;
 
                 viewOffset->setValueAndWarp(axisOffsetVector(workspaceOverviewLogicalOffset(workspaceIdx, ACTIVEIDX, FINALPITCH), layout));
@@ -4936,7 +4947,7 @@ void CScrollOverview::close() {
         }
     }
 
-    focusSyncedFromWorkspaceID = WORKSPACE_INVALID;
+    focusSyncedFromWorkspaceKey.clear();
 
     const auto FINALWINDOW    = getOverviewWindowToShow(closeOnWindow.lock());
     const auto FINALWORKSPACE = FINALWINDOW ? FINALWINDOW->m_workspace : SELECTEDWORKSPACE;
@@ -4974,12 +4985,12 @@ void CScrollOverview::onPreRender() {
         rebuildPending = false;
         markBlurDirty();
         onWorkspaceChange();
-        focusSyncedFromWorkspaceID = WORKSPACE_INVALID;
+        focusSyncedFromWorkspaceKey.clear();
         emitFullscreenVisibilityState(Desktop::focusState()->window(), true);
         return;
     }
 
-    focusSyncedFromWorkspaceID = WORKSPACE_INVALID;
+    focusSyncedFromWorkspaceKey.clear();
 
     if (rebuildPending) {
         rebuildPending = false;
@@ -5003,24 +5014,24 @@ void CScrollOverview::onWorkspaceChange() {
     const double GESTURESETTLEOFFSET = trackpadGestureSettleOffset;
     trackpadGestureSettlePending     = false;
 
-    std::vector<WORKSPACEID> previousWorkspaceIDs;
-    previousWorkspaceIDs.reserve(images.size());
-    std::unordered_map<WORKSPACEID, float> previousWorkspaceOffsets;
+    std::vector<std::string> previousWorkspaceKeys;
+    previousWorkspaceKeys.reserve(images.size());
+    std::unordered_map<std::string, float> previousWorkspaceOffsets;
     const auto PREVIOUSLOGICALPITCH = getWorkspaceLogicalPitch(pMonitor.lock(), scale->value(), layout);
     for (size_t i = 0; i < images.size(); ++i) {
         const auto& image = images[i];
         if (!image || !image->pWorkspace)
             continue;
 
-        previousWorkspaceIDs.push_back(image->pWorkspace->m_id);
-        previousWorkspaceOffsets.emplace(image->pWorkspace->m_id, workspaceOverviewLogicalOffset(i, previousActiveIdx, PREVIOUSLOGICALPITCH));
+        previousWorkspaceKeys.push_back(Workspace::selector(*image->pWorkspace));
+        previousWorkspaceOffsets.emplace(Workspace::selector(*image->pWorkspace), workspaceOverviewLogicalOffset(i, previousActiveIdx, PREVIOUSLOGICALPITCH));
     }
 
     const auto NEWWORKSPACE      = pMonitor->m_activeWorkspace;
-    const bool INSERTEDWORKSPACE = std::find(previousWorkspaceIDs.begin(), previousWorkspaceIDs.end(), NEWWORKSPACE->m_id) == previousWorkspaceIDs.end();
+    const bool INSERTEDWORKSPACE         = std::find(previousWorkspaceKeys.begin(), previousWorkspaceKeys.end(), Workspace::selector(*NEWWORKSPACE)) == previousWorkspaceKeys.end();
     const auto REQUESTEDREMOVEDWORKSPACE = pendingRemovedWorkspace.lock();
-    const bool SHOULDREMOVEPREVIOUSWORKSPACE =
-        previousStartedOn && previousStartedOn != NEWWORKSPACE && !previousStartedOn->m_isSpecialWorkspace && !previousStartedOn->isPersistent() && previousStartedOn->getWindowCount() == 0;
+    const bool SHOULDREMOVEPREVIOUSWORKSPACE = previousStartedOn && previousStartedOn != NEWWORKSPACE && previousStartedOn->type() == Workspace::eWorkspaceType::NORMAL &&
+        !sc<Workspace::CRegularWorkspace*>(previousStartedOn.get())->isPersistent() && previousStartedOn->getWindowCount() == 0;
     const auto REMOVEDWORKSPACE = REQUESTEDREMOVEDWORKSPACE ? REQUESTEDREMOVEDWORKSPACE : SHOULDREMOVEPREVIOUSWORKSPACE ? previousStartedOn : PHLWORKSPACE{};
 
     pendingRemovedWorkspace = REMOVEDWORKSPACE;
@@ -5035,17 +5046,17 @@ void CScrollOverview::onWorkspaceChange() {
 
     if (INSERTEDWORKSPACE || REMOVEDPREVIOUSWORKSPACE) {
         workspaceInsertTransition.active                 = true;
-        workspaceInsertTransition.transitionWorkspaceID  = INSERTEDWORKSPACE ? NEWWORKSPACE->m_id : REMOVEDWORKSPACE->m_id;
+        workspaceInsertTransition.transitionWorkspaceKey = INSERTEDWORKSPACE ? Workspace::selector(*NEWWORKSPACE) : Workspace::selector(*REMOVEDWORKSPACE);
         workspaceInsertTransition.transitionFadeIn       = INSERTEDWORKSPACE;
         workspaceInsertFadeProgress->setConfig(INSERTEDWORKSPACE ? workspaceInsertFadeConfig : workspaceRemoveFadeConfig);
         workspaceInsertTransition.oldRelativeOffsets.clear();
         workspaceInsertTransition.newRelativeOffsets.clear();
         workspaceInsertTransition.transitionOldRelativeOffset = 0.F;
 
-        for (size_t i = 0; i < previousWorkspaceIDs.size(); ++i) {
-            const auto OFFSET = previousWorkspaceOffsets.contains(previousWorkspaceIDs[i]) ? previousWorkspaceOffsets.at(previousWorkspaceIDs[i]) : 0.F;
-            workspaceInsertTransition.oldRelativeOffsets.emplace(previousWorkspaceIDs[i], OFFSET);
-            if (REMOVEDPREVIOUSWORKSPACE && previousWorkspaceIDs[i] == REMOVEDWORKSPACE->m_id)
+        for (size_t i = 0; i < previousWorkspaceKeys.size(); ++i) {
+            const auto OFFSET = previousWorkspaceOffsets.contains(previousWorkspaceKeys[i]) ? previousWorkspaceOffsets.at(previousWorkspaceKeys[i]) : 0.F;
+            workspaceInsertTransition.oldRelativeOffsets.emplace(previousWorkspaceKeys[i], OFFSET);
+            if (REMOVEDPREVIOUSWORKSPACE && previousWorkspaceKeys[i] == Workspace::selector(*REMOVEDWORKSPACE))
                 workspaceInsertTransition.transitionOldRelativeOffset = OFFSET;
         }
 
@@ -5054,7 +5065,8 @@ void CScrollOverview::onWorkspaceChange() {
             if (!images[i] || !images[i]->pWorkspace)
                 continue;
 
-            workspaceInsertTransition.newRelativeOffsets.emplace(images[i]->pWorkspace->m_id, workspaceOverviewLogicalOffset(i, viewportCurrentWorkspace, NEWLOGICALPITCH));
+            workspaceInsertTransition.newRelativeOffsets.emplace(Workspace::selector(*images[i]->pWorkspace),
+                                                                 workspaceOverviewLogicalOffset(i, viewportCurrentWorkspace, NEWLOGICALPITCH));
         }
 
         workspaceInsertProgress->setValueAndWarp(0.F);
@@ -5065,7 +5077,7 @@ void CScrollOverview::onWorkspaceChange() {
         *viewOffset = Vector2D{};
     } else {
         workspaceInsertTransition.active                 = false;
-        workspaceInsertTransition.transitionWorkspaceID  = WORKSPACE_INVALID;
+        workspaceInsertTransition.transitionWorkspaceKey.clear();
         workspaceInsertTransition.transitionFadeIn       = true;
         workspaceInsertFadeProgress->setConfig(workspaceInsertFadeConfig);
         workspaceInsertTransition.oldRelativeOffsets.clear();
