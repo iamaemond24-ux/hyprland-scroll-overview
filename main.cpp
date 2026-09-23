@@ -676,7 +676,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // rendering hooks inside hkChangeWorkspace, which still needs its original function.
     g_pScrollChangeWorkspaceHook = HyprlandAPI::createFunctionHook(
         SCROLLOVERVIEW_HANDLE,
-        findFnOrThrow("changeWorkspace", {"Config::Actions::changeWorkspace(Hyprutils::Memory::CSharedPointer<CWorkspace>"}),
+        findFnOrThrow("changeWorkspace", {"Config::Actions::changeWorkspace(Hyprutils::Memory::CSharedPointer<Workspace::CHLWorkspace>"}),
         rc<void*>(hkChangeWorkspace));
     if (!g_pScrollChangeWorkspaceHook || !g_pScrollChangeWorkspaceHook->hook()) {
         failNotif("Failed enabling workspace change hook");
