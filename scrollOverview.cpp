@@ -69,6 +69,7 @@
 #undef private
 #include "Config.hpp"
 #include "DropIndicator.hpp"
+#include "globals.hpp"
 #include "NativeDrag.hpp"
 #include "OverviewOpen.hpp"
 #include "OverviewPassElement.hpp"
@@ -1019,6 +1020,7 @@ CScrollOverview::~CScrollOverview() {
     restoreForcedWindowVisibility();
     restoreForcedLayerVisibility();
     images.clear(); // otherwise we get a vram leak
+    g_fOverviewRenderScale = 1.F;
     if (scrollOverviews().empty()) {
         restoreActiveWorkspaceVisibility();
         Pointer::Cursor::overrideController->unsetOverride(Pointer::Cursor::CURSOR_OVERRIDE_SPECIAL_ACTION);
@@ -5102,6 +5104,7 @@ void CScrollOverview::close(ECloseMode mode) {
         emitFullscreenVisibilityState(getOverviewFullscreenVisibilityWindow(finalWorkspace, finalWindow), false);
 
         *scale = 1.F;
+        g_fOverviewRenderScale = 1.F;
 
         if (!ScrollOverview::Config::getValue<int>("animations:enabled")) {
             forceWorkspaceWindowsDecoRecalc(finalWorkspace ? finalWorkspace : pMonitor->m_activeWorkspace);
@@ -5384,6 +5387,7 @@ void CScrollOverview::render() {
     const auto NOW       = Time::steadyNow();
     const auto ACTIVEIDX = activeWorkspaceIndex();
     const auto SCALE     = scale->value();
+    g_fOverviewRenderScale = SCALE;
     const auto PITCH     = getWorkspaceRenderedPitch(MONITOR, SCALE, layout);
 
     const auto VIEWOFFSET = viewOffset->value();
