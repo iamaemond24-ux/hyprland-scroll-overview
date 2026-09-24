@@ -1,4 +1,5 @@
 #include "scrollOverview.hpp"
+#include "WorkspaceSlotMath.hpp"
 #include <algorithm>
 #include <any>
 #include <array>
@@ -1943,7 +1944,13 @@ void CScrollOverview::rebuildWorkspaceImages() {
         if (!valid(WORKSPACE) || WORKSPACE->m_monitor != pMonitor || WORKSPACE->type() == Workspace::eWorkspaceType::SPECIAL)
             continue;
 
-        if (WORKSPACE == REMOVEDWORKSPACE)
+        // `pendingRemovedWorkspace` drives the collapse animation of the workspace we just left, but a
+        // workspace we only stepped across can come back to life — a window dragged onto it, an
+        // on-created-empty rule — while a stale value still names it. Hiding a populated workspace then
+        // costs it its card and, if it is the one we sit on, drops the viewport back to the first card.
+        // A workspace we are on is never the one being removed, and an empty one can only be the
+        // workspace just left, so both exclusions are safe to keep.
+        if (WORKSPACE == REMOVEDWORKSPACE && WORKSPACE != startedOn && WORKSPACE->getWindowCount() == 0)
             continue;
 
         images.emplace_back(makeShared<SWorkspaceImage>(WORKSPACE));
@@ -3493,39 +3500,151 @@ void CScrollOverview::endWindowResize() {
     damage();
 }
 
-void CScrollOverview::moveViewportWorkspace(bool up) {
-    if (images.empty())
-        return;
+bool CScrollOverview::moveViewportWorkspace(bool up) {
+    // dispatchers do not filter out a closing overview, so a held key can land here mid-close
+    if (closing || images.empty())
+        return false;
 
+    const auto MONITOR = pMonitor.lock();
+    if (!MONITOR)
+        return false;
+
+    const auto CURRENTWORKSPACE = viewportWorkspace();
+    if (!CURRENTWORKSPACE)
+        return false;
+
+    // Named workspaces have no slot number to do arithmetic on; fall back to plain index stepping.
+    const auto CURRENTSLOT = CURRENTWORKSPACE->numberedID();
+    if (!CURRENTSLOT)
+        return moveViewportWorkspaceByIndex(up);
+
+    // A step creates the slot it lands on, so it depends on nothing but the current slot — see
+    // WorkspaceSlotMath.hpp for why that has to be the case.
+    const auto TARGETSLOT = ScrollOverview::Slots::stepTarget({.current = *CURRENTSLOT}, up);
+    if (!TARGETSLOT)
+        return false;
+
+    return activateWorkspaceSlot(*TARGETSLOT);
+}
+
+// Go to a numbered slot, creating the workspace if it is not there yet. The created workspace is empty
+// and is destroyed again on its own once the viewport leaves it — nothing here holds it.
+bool CScrollOverview::activateWorkspaceSlot(uint32_t slot) {
+    const auto MONITOR = pMonitor.lock();
+    if (!MONITOR)
+        return false;
+
+    // read before creating: an on-created-empty rule can run dispatchers, and this is the workspace we are
+    // stepping off, not whatever such a rule may have switched to
+    const auto CURRENTWORKSPACE = viewportWorkspace();
+
+    auto target = numberedWorkspaceOnMonitor(slot);
+    if (!target) {
+        target = State::workspaceState()->createNumbered(::Workspace::SWorkspaceNumberedID{slot}, MONITOR, {}, true);
+        if (!target)
+            return false;
+
+        // a workspace rule can bind the new slot to a different monitor; switching to it here would make
+        // it the active workspace of two monitors at once. Refuse instead — nothing strong holds it now,
+        // so it is destroyed again on its own.
+        if (target->m_monitor != MONITOR)
+            return false;
+    }
+
+    if (target == CURRENTWORKSPACE)
+        return false;
+
+    return activateViewportWorkspace(target);
+}
+
+bool CScrollOverview::moveViewportWorkspaceByIndex(bool up) {
     if (viewportCurrentWorkspace == 0 && !up)
-        return;
-    if (viewportCurrentWorkspace == images.size() - 1 && up)
-        return;
+        return false;
+    if (viewportCurrentWorkspace + 1 >= images.size() && up)
+        return false;
 
-    if (up)
-        viewportCurrentWorkspace++;
-    else
-        viewportCurrentWorkspace--;
+    const size_t TARGETIDX = up ? viewportCurrentWorkspace + 1 : viewportCurrentWorkspace - 1;
+    if (TARGETIDX >= images.size() || !images[TARGETIDX] || !images[TARGETIDX]->pWorkspace)
+        return false;
 
-    const auto& TARGETWORKSPACEIMAGE = images[viewportCurrentWorkspace];
-    if (!TARGETWORKSPACEIMAGE || !TARGETWORKSPACEIMAGE->pWorkspace)
-        return;
+    const size_t BEFORE      = viewportCurrentWorkspace;
+    viewportCurrentWorkspace = TARGETIDX;
+
+    if (!activateViewportWorkspace(images[TARGETIDX]->pWorkspace)) {
+        viewportCurrentWorkspace = BEFORE;
+        return false;
+    }
+
+    return true;
+}
+
+bool CScrollOverview::activateViewportWorkspace(const PHLWORKSPACE& workspace) {
+    if (!workspace)
+        return false;
 
     closeOnWindow.reset();
 
-    if (const auto it = rememberedSelection.find(Workspace::selector(*TARGETWORKSPACEIMAGE->pWorkspace)); it != rememberedSelection.end()) {
+    if (const auto it = rememberedSelection.find(Workspace::selector(*workspace)); it != rememberedSelection.end()) {
         const auto rememberedWindow = getOverviewWindowToShow(it->second.lock());
-        if (rememberedWindow && rememberedWindow->m_workspace == TARGETWORKSPACEIMAGE->pWorkspace && shouldShowOverviewWindow(rememberedWindow))
+        if (rememberedWindow && rememberedWindow->m_workspace == workspace && shouldShowOverviewWindow(rememberedWindow))
             closeOnWindow = rememberedWindow;
     }
 
-    if (!closeOnWindow)
-        closeOnWindow = windowClosestToWorkspaceCenter(viewportCurrentWorkspace);
+    // a workspace created by this step has no card yet, and would have no windows either
+    if (!closeOnWindow) {
+        if (const auto IDX = workspaceIndexInImages(workspace); IDX < images.size())
+            closeOnWindow = windowClosestToWorkspaceCenter(IDX);
+    }
 
-    if (pMonitor && pMonitor->m_activeWorkspace != TARGETWORKSPACEIMAGE->pWorkspace)
-        changeOverviewWorkspace(pMonitor.lock(), TARGETWORKSPACEIMAGE->pWorkspace);
+    if (pMonitor && pMonitor->m_activeWorkspace != workspace)
+        changeOverviewWorkspace(pMonitor.lock(), workspace);
 
     damage();
+
+    return pMonitor && pMonitor->m_activeWorkspace == workspace;
+}
+
+PHLWORKSPACE CScrollOverview::viewportWorkspace() const {
+    const auto MONITOR = pMonitor.lock();
+    const auto VIEWPORTWORKSPACE =
+        viewportCurrentWorkspace < images.size() && images[viewportCurrentWorkspace] ? images[viewportCurrentWorkspace]->pWorkspace : PHLWORKSPACE{};
+
+    if (!VIEWPORTWORKSPACE)
+        return MONITOR ? MONITOR->m_activeWorkspace : PHLWORKSPACE{};
+
+    // The strip is only rebuilt on render.pre, so between a step and the next frame the index still
+    // names the workspace we just left while the monitor has already moved on. Trust the monitor, but
+    // only in that window: a workspace that is still in `images` is what the strip is really showing.
+    if (MONITOR && MONITOR->m_activeWorkspace && MONITOR->m_activeWorkspace != VIEWPORTWORKSPACE &&
+        workspaceIndexInImages(MONITOR->m_activeWorkspace) == images.size())
+        return MONITOR->m_activeWorkspace;
+
+    return VIEWPORTWORKSPACE;
+}
+
+size_t CScrollOverview::workspaceIndexInImages(const PHLWORKSPACE& workspace) const {
+    if (!workspace)
+        return images.size();
+
+    for (size_t i = 0; i < images.size(); ++i) {
+        if (images[i] && images[i]->pWorkspace == workspace)
+            return i;
+    }
+
+    return images.size();
+}
+
+PHLWORKSPACE CScrollOverview::numberedWorkspaceOnMonitor(uint32_t slot) const {
+    for (const auto& workspaceRef : State::workspaceState()->workspaces()) {
+        const auto WORKSPACE = workspaceRef.lock();
+        if (!valid(WORKSPACE) || WORKSPACE->m_monitor != pMonitor || WORKSPACE->type() == Workspace::eWorkspaceType::SPECIAL)
+            continue;
+
+        if (const auto ID = WORKSPACE->numberedID(); ID && *ID == slot)
+            return WORKSPACE;
+    }
+
+    return {};
 }
 
 bool CScrollOverview::scrollStepAllowed(uint32_t timeMs) {
@@ -3600,6 +3719,10 @@ double CScrollOverview::trackpadWorkspaceScrollOffset(PHLMONITOR monitor, float 
         maxOffset                    = std::max(maxOffset, WORKSPACEOFFSET);
     }
 
+    // Leave one card of travel past the rightmost card: releasing there creates the slot after it (see
+    // finishWorkspaceScrollFollow). Forward only — the leftmost card ends the gesture.
+    maxOffset += LOGICALPITCH;
+
     offset              = std::clamp(offset, minOffset, maxOffset);
     trackpadScrollAccum = offset * RENDEREDLOGICALUNIT;
 
@@ -3627,11 +3750,14 @@ void CScrollOverview::finishWorkspaceScrollFollow() {
     const double VIEWPORTCENTER = axisSize(MONITOR->m_size * MONITOR->m_scale, layout) / 2.0;
 
     size_t targetIdx    = viewportCurrentWorkspace;
+    size_t lastIdx      = viewportCurrentWorkspace;
     double bestDistance = std::numeric_limits<double>::max();
 
     for (size_t i = 0; i < images.size(); ++i) {
         if (!images[i] || !images[i]->pWorkspace)
             continue;
+
+        lastIdx = i; // images are in strip order, so the last one holding a workspace is the rightmost card
 
         const auto   WORKSPACEBOX = getOverviewWorkspaceBox(MONITOR, SCALE, viewOffset->value(), workspaceOverviewOffset(i, ACTIVEIDX, RENDEREDPITCH), layout);
         const double DISTANCE     = std::abs(axisValue(WORKSPACEBOX.middle(), layout) - VIEWPORTCENTER);
@@ -3641,24 +3767,38 @@ void CScrollOverview::finishWorkspaceScrollFollow() {
         }
     }
 
+    const double OFFSET = axisValue(viewOffset->value(), layout);
+
+    // Let go past the rightmost card by more than half a card and the gesture is asking for the slot after
+    // it, which does not exist yet — that is the reserved card of travel the offset clamp leaves. Create
+    // it, as a forward step would; being new to the strip, it gets the insert transition on its own.
+    if (!closing && OFFSET > workspaceOverviewLogicalOffset(lastIdx, viewportCurrentWorkspace, LOGICALPITCH) + LOGICALPITCH / 2.0) {
+        *viewOffset = Vector2D{};
+        const auto LASTSLOT = images[lastIdx] && images[lastIdx]->pWorkspace ? images[lastIdx]->pWorkspace->numberedID() : std::nullopt;
+        if (LASTSLOT)
+            activateWorkspaceSlot(*LASTSLOT + 1);
+        return;
+    }
+
     if (targetIdx == viewportCurrentWorkspace) {
         *viewOffset = Vector2D{};
         return;
     }
 
-    const double OFFSET       = axisValue(viewOffset->value(), layout);
     const double TARGETOFFSET = workspaceOverviewLogicalOffset(targetIdx, viewportCurrentWorkspace, LOGICALPITCH);
 
     trackpadGestureSettleOffset  = OFFSET - TARGETOFFSET;
     trackpadGestureSettlePending = true;
 
+    // Jump straight to the column the gesture settled on. Stepping there one at a time would walk slot
+    // numbers rather than `images` indices, so dragging towards workspace 4 out of [1, 4] would land on
+    // the workspace created at slot 2 instead. Within the materialized strip it is always a jump to a
+    // card that is already there; only the reserved slot past the end creates anything.
     const size_t BEFORE = viewportCurrentWorkspace;
-    const bool   NEXT   = targetIdx > viewportCurrentWorkspace;
-    const size_t STEPS  = sc<size_t>(std::abs(sc<long>(targetIdx) - sc<long>(viewportCurrentWorkspace)));
-    for (size_t i = 0; i < STEPS; ++i)
-        moveViewportWorkspace(NEXT);
+    viewportCurrentWorkspace = targetIdx;
 
-    if (viewportCurrentWorkspace == BEFORE) {
+    if (!activateViewportWorkspace(images[targetIdx]->pWorkspace)) {
+        viewportCurrentWorkspace     = BEFORE;
         trackpadGestureSettlePending = false;
         *viewOffset                  = Vector2D{};
     }
@@ -3877,8 +4017,7 @@ bool CScrollOverview::moveSelection(const std::string& direction) {
         if (((MOVINGLEFT || MOVINGRIGHT) && layout != ScrollOverview::Config::ELayout::HORIZONTAL) || ((MOVINGUP || MOVINGDOWN) && layout == ScrollOverview::Config::ELayout::HORIZONTAL))
             return false;
 
-        moveViewportWorkspace(MOVINGRIGHT || MOVINGDOWN);
-        return true;
+        return moveViewportWorkspace(MOVINGRIGHT || MOVINGDOWN);
     }
 
     closeOnWindow = bestCandidate;
@@ -5086,9 +5225,7 @@ void CScrollOverview::close(ECloseMode mode) {
     const bool PRESERVEMONITORSTATE = mode == ECloseMode::PRESERVE_MONITOR_STATE;
     const bool ACTIVATESELECTION    = !PRESERVEMONITORSTATE && activeScrollOverview().get() == this;
     const auto MONITOR              = pMonitor.lock();
-    const auto SELECTEDWORKSPACE    = PRESERVEMONITORSTATE ?
-        (MONITOR ? MONITOR->m_activeWorkspace : PHLWORKSPACE{}) :
-        (viewportCurrentWorkspace < images.size() && images[viewportCurrentWorkspace] ? images[viewportCurrentWorkspace]->pWorkspace : PHLWORKSPACE{});
+    const auto SELECTEDWORKSPACE    = PRESERVEMONITORSTATE ? (MONITOR ? MONITOR->m_activeWorkspace : PHLWORKSPACE{}) : viewportWorkspace();
 
     if (PRESERVEMONITORSTATE) {
         closeOnWindow.reset();
@@ -5306,7 +5443,12 @@ void CScrollOverview::onWorkspaceChange() {
     const auto REQUESTEDREMOVEDWORKSPACE = pendingRemovedWorkspace.lock();
     const bool SHOULDREMOVEPREVIOUSWORKSPACE = previousStartedOn && previousStartedOn != NEWWORKSPACE && previousStartedOn->type() == Workspace::eWorkspaceType::NORMAL &&
         !sc<Workspace::CRegularWorkspace*>(previousStartedOn.get())->isPersistent() && previousStartedOn->getWindowCount() == 0;
-    const auto REMOVEDWORKSPACE = REQUESTEDREMOVEDWORKSPACE ? REQUESTEDREMOVEDWORKSPACE : SHOULDREMOVEPREVIOUSWORKSPACE ? previousStartedOn : PHLWORKSPACE{};
+    // A request left over from an earlier frame can name the workspace we are switching to — we stepped
+    // onto it before the strip rebuilt — and letting it win would hide the card we are moving to. Fall
+    // through to the previous-workspace decision instead; the field is overwritten just below.
+    const auto REMOVEDWORKSPACE = REQUESTEDREMOVEDWORKSPACE && REQUESTEDREMOVEDWORKSPACE != NEWWORKSPACE ? REQUESTEDREMOVEDWORKSPACE :
+        SHOULDREMOVEPREVIOUSWORKSPACE                                                                    ? previousStartedOn :
+                                                                                                           PHLWORKSPACE{};
 
     pendingRemovedWorkspace = REMOVEDWORKSPACE;
 

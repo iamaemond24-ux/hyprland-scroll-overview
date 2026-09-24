@@ -12,6 +12,7 @@
 #include <hyprland/src/render/Framebuffer.hpp>
 #include <hyprland/src/render/types.hpp>
 #include <chrono>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -92,7 +93,13 @@ class CScrollOverview : public IOverview {
                              bool dragged = false);
     void   renderDraggedWindow(PHLMONITOR monitor, size_t activeIdx, float workspacePitch, float renderScale, const Time::steady_tp& now);
     void   renderPinnedFloatingWindows(PHLMONITOR monitor, float overviewScale, const Time::steady_tp& now);
-    void   moveViewportWorkspace(bool up);
+    bool   moveViewportWorkspace(bool up);
+    bool   moveViewportWorkspaceByIndex(bool up);
+    bool   activateWorkspaceSlot(uint32_t slot);
+    bool   activateViewportWorkspace(const PHLWORKSPACE& workspace);
+    PHLWORKSPACE viewportWorkspace() const;
+    size_t       workspaceIndexInImages(const PHLWORKSPACE& workspace) const;
+    PHLWORKSPACE                numberedWorkspaceOnMonitor(uint32_t slot) const;
     void   trackpadSwipeLayout(const PHLWORKSPACE target, const double delta);
     void   trackpadSwipeWorkspace(const double delta);
     void   finishWorkspaceScrollFollow();

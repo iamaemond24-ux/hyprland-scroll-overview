@@ -185,11 +185,20 @@ static void hkDamageSurface(void* thisptr, SP<CWLSurfaceResource> surface, doubl
     }
 }
 
-static void hkSendFrameEventsToWorkspace(void* thisptr, PHLMONITOR monitor, PHLWORKSPACE workspace, const Time::steady_tp& now) {
-    if (scrollOverviewForMonitor(monitor))
+// `monitor` is deliberately never read. Hyprland is built with clang, and for a call site that can see the
+// body of sendFrameEventsToWorkspace — renderMonitor sits in the same translation unit as it — clang drops
+// the argument outright, because that body never looks at pMonitor. Call sites in other translation units
+// still pass it, so on the renderMonitor path the register merely holds a leftover from earlier code, and
+// copy-constructing the SP from it segfaults. That is why this crashed from any empty workspace: an empty
+// workspace renders nothing, so the monitor's damage is empty, and that is the branch reaching the call.
+// The workspace, unlike the monitor, is passed by every call site — the callee could not iterate otherwise.
+static void hkSendFrameEventsToWorkspace(void* thisptr, [[maybe_unused]] PHLMONITOR monitor, PHLWORKSPACE workspace, const Time::steady_tp& now) {
+    const auto MONITOR = workspace && workspace->m_monitor ? workspace->m_monitor.lock() : PHLMONITOR{};
+
+    if (scrollOverviewForMonitor(MONITOR))
         return;
 
-    rc<origSendFrameEventsToWorkspace>(g_pScrollSendFrameEventsHook->m_original)(thisptr, monitor, workspace, now);
+    rc<origSendFrameEventsToWorkspace>(g_pScrollSendFrameEventsHook->m_original)(thisptr, MONITOR, workspace, now);
 }
 
 static void hkSurfaceFrame(void* thisptr, const Time::steady_tp& now) {
