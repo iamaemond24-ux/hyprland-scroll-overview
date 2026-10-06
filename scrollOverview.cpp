@@ -4501,16 +4501,6 @@ void CScrollOverview::renderWorkspaceLive(PHLMONITOR monitor, size_t workspaceId
         workspace->m_forceRendering = WASFORCERENDERING;
     });
 
-    // Render TOP and OVERLAY layer surfaces (top bar, dock, etc.) into each
-    // workspace card so previews reflect the live shell as it appears on
-    // screen. Via a scope guard so it also covers the fullscreen-workspace
-    // early return below (Super+D and similar) — without it, a workspace with
-    // a fullscreen window would skip the in-card bar render entirely.
-    auto renderShellLayersOnExit = Hyprutils::Utils::CScopeGuard([monitor, WORKSPACEBOX, renderScale, now] {
-        renderOverviewLayerLevel(monitor, ZWLR_LAYER_SHELL_V1_LAYER_TOP, WORKSPACEBOX, renderScale, now);
-        renderOverviewLayerLevel(monitor, ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, WORKSPACEBOX, renderScale, now);
-    });
-
     const auto renderOverviewWindow = [&](const PHLWINDOW& window) {
         if (!shouldShowOverviewWindow(window))
             return;
